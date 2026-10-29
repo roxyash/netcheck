@@ -1,0 +1,290 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Проверка связи</title>
+<link rel="icon" href="data:,">
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #ffffff; --text: #16191d; --muted: #646b75; --line: #e3e6ea;
+    --accent: #1f6feb; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --card: #171b21; --text: #e6e9ed; --muted: #9aa3ad; --line: #2a3038;
+      --accent: #4c8dff; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 560px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 24px; margin: 0 0 8px; }
+  p { margin: 0 0 16px; color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; margin-bottom: 16px; }
+  label { display: block; font-weight: 600; margin: 0 0 6px; }
+  select, input, textarea {
+    width: 100%; font: inherit; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin-bottom: 14px;
+  }
+  textarea { font: 12px/1.4 ui-monospace, Menlo, monospace; height: 160px; resize: vertical; }
+  button {
+    width: 100%; font: inherit; font-weight: 600; color: #fff; background: var(--accent);
+    border: 0; border-radius: 8px; padding: 12px; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  .row { display: flex; justify-content: space-between; gap: 12px; padding: 10px 0; border-top: 1px solid var(--line); }
+  .row:first-child { border-top: 0; }
+  .name { font-weight: 600; }
+  .detail { color: var(--muted); font-size: 14px; }
+  .status { white-space: nowrap; font-weight: 600; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .wait { color: var(--muted); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Проверка связи</h1>
+  <p>Страница проверит, как ваш интернет достает до нескольких серверов. Это займет около минуты.
+    В результат попадают только скорость, задержка и объем данных, без адреса и истории браузера.</p>
+
+  <form class="card" id="form">
+    <label for="op">Оператор</label>
+    <select id="op" required>
+      <option value="">Выберите</option>
+      <option>МТС</option><option>Билайн</option><option>МегаФон</option><option>T2 (Tele2)</option>
+      <option>Yota</option><option>Ростелеком</option><option>Дом.ру</option><option>МГТС</option>
+      <option>Другой</option>
+    </select>
+
+    <label for="net">Подключение</label>
+    <select id="net" required>
+      <option value="">Выберите</option>
+      <option value="mobile">Мобильный интернет</option>
+      <option value="home">Домашний Wi-Fi или кабель</option>
+      <option value="public">Другой Wi-Fi (кафе, работа)</option>
+    </select>
+
+    <label for="city">Город</label>
+    <input id="city" autocomplete="address-level2" placeholder="Например, Казань">
+
+    <button id="start">Начать проверку</button>
+  </form>
+
+  <section class="card" id="progress" hidden></section>
+
+  <section class="card" id="result" hidden>
+    <label for="out">Результат</label>
+    <p>Скопируйте текст и отправьте тому, кто дал вам ссылку.</p>
+    <textarea id="out" readonly></textarea>
+    <button id="copy" type="button">Скопировать</button>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// Каждая цель проверяется по очереди. Контроль – файл с этого же сайта: если и он
+// не грузится, проблема в связи у тестера, а не в блокировке.
+const TARGETS = [
+  { id: "ctrl", name: "Контроль", ping: null, data: new URL("blob.bin", location.href).href },
+  { id: "s1", name: "Сервер 1", ping: "https://nc.2-29-28-210.sslip.io/ping", data: "https://nc.2-29-28-210.sslip.io/bytes?n=2097152" },
+];
+
+const PINGS = 5;
+const PING_TIMEOUT = 8000;
+const STALL_MS = 6000;      // столько без новых байт считаем заморозкой
+const DOWNLOAD_MS = 25000;  // общий потолок на одну загрузку
+
+const $ = (id) => document.getElementById(id);
+const now = () => performance.now();
+const bust = (url) => url + (url.includes("?") ? "&" : "?") + "r=" + Math.random().toString(36).slice(2);
+
+async function ping(url) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), PING_TIMEOUT);
+  const u = bust(url);
+  const t0 = now();
+  try {
+    const resp = await fetch(u, { cache: "no-store", signal: ctl.signal });
+    // Resource Timing запись появляется только после того, как тело дочитано.
+    await resp.arrayBuffer();
+    const ms = Math.round(now() - t0);
+    await new Promise((r) => setTimeout(r, 0));
+    const e = performance.getEntriesByName(u)[0];
+    const timing = e && e.connectEnd > 0 ? {
+      connMs: Math.round(e.connectEnd - e.connectStart),
+      tlsMs: e.secureConnectionStart > 0 ? Math.round(e.connectEnd - e.secureConnectionStart) : null,
+    } : {};
+    return { ok: true, ms, ...timing };
+  } catch (err) {
+    return { ok: false, ms: Math.round(now() - t0), err: err.name };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Качает url и следит, на каком байте поток встал.
+async function download(url, onProgress) {
+  const ctl = new AbortController();
+  const t0 = now();
+  let bytes = 0, firstByte = null, lastByte = t0, reason = null;
+
+  const watchdog = setInterval(() => {
+    const t = now();
+    if (t - lastByte > STALL_MS) { reason = "stall"; ctl.abort(); }
+    else if (t - t0 > DOWNLOAD_MS) { reason = "limit"; ctl.abort(); }
+  }, 250);
+
+  try {
+    const resp = await fetch(bust(url), { cache: "no-store", signal: ctl.signal });
+    if (!resp.ok) return { status: "http_" + resp.status, bytes, ms: Math.round(now() - t0) };
+    const total = Number(resp.headers.get("Content-Length")) || null;
+    const reader = resp.body.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      lastByte = now();
+      if (firstByte === null) firstByte = lastByte;
+      bytes += value.length;
+      onProgress(bytes, total);
+    }
+    return summarize("ok");
+  } catch (err) {
+    if (reason === "stall") return summarize("frozen");
+    if (reason === "limit") return summarize("slow");
+    return { ...summarize("failed"), err: err.name };
+  } finally {
+    clearInterval(watchdog);
+  }
+
+  function summarize(status) {
+    const active = firstByte === null ? 0 : lastByte - firstByte;
+    return {
+      status, bytes,
+      ms: Math.round(now() - t0),
+      firstByteMs: firstByte === null ? null : Math.round(firstByte - t0),
+      mbps: active > 200 ? +(bytes * 8 / active / 1000).toFixed(2) : null,
+    };
+  }
+}
+
+function row(target) {
+  const el = document.createElement("div");
+  el.className = "row";
+  el.innerHTML = '<div><div class="name"></div><div class="detail"></div></div><div class="status wait">ждет</div>';
+  el.querySelector(".name").textContent = target.name;
+  $("progress").append(el);
+  return {
+    detail: (text) => { el.querySelector(".detail").textContent = text; },
+    status: (text, cls) => { const s = el.querySelector(".status"); s.textContent = text; s.className = "status " + cls; },
+  };
+}
+
+const kb = (b) => b < 1024 * 1024 ? Math.round(b / 1024) + " КБ" : (b / 1024 / 1024).toFixed(1) + " МБ";
+
+const VERDICT = {
+  ok: ["работает", "ok"],
+  slow: ["медленно", "warn"],
+  frozen: ["зависает", "bad"],
+  failed: ["не открывается", "bad"],
+  unreachable: ["не открывается", "bad"],
+};
+
+async function check(target, ui) {
+  const result = { id: target.id };
+  ui.status("проверка", "wait");
+
+  if (target.ping) {
+    ui.detail("задержка");
+    const pings = [];
+    for (let i = 0; i < PINGS; i++) {
+      const p = await ping(target.ping);
+      pings.push(p);
+      if (!p.ok && i === 0) break;
+    }
+    result.pings = pings;
+    if (!pings[0].ok) {
+      result.status = "unreachable";
+      ui.detail("сервер не отвечает (" + pings[0].err + ")");
+      ui.status(...VERDICT.unreachable);
+      return result;
+    }
+  }
+
+  ui.detail("загрузка");
+  result.download = await download(target.data, (bytes, total) => {
+    ui.detail("загрузка: " + kb(bytes) + (total ? " из " + kb(total) : ""));
+  });
+  result.status = result.download.status;
+
+  const d = result.download;
+  const parts = [kb(d.bytes)];
+  if (d.mbps) parts.push(d.mbps + " Мбит/с");
+  if (result.pings) {
+    const ok = result.pings.filter((p) => p.ok).map((p) => p.ms).sort((a, b) => a - b);
+    if (ok.length) parts.push("пинг " + ok[Math.floor(ok.length / 2)] + " мс");
+  }
+  ui.detail(parts.join(" · "));
+  ui.status(...(VERDICT[result.status] || [result.status, "warn"]));
+  return result;
+}
+
+function device() {
+  const ua = navigator.userAgent;
+  const os = /iPhone|iPad/.test(ua) ? "iOS" : /Android/.test(ua) ? "Android"
+    : /Windows/.test(ua) ? "Windows" : /Mac OS/.test(ua) ? "macOS" : /Linux/.test(ua) ? "Linux" : "other";
+  const browser = /YaBrowser/.test(ua) ? "Yandex" : /Edg\//.test(ua) ? "Edge" : /Firefox|FxiOS/.test(ua) ? "Firefox"
+    : /Chrome|CriOS/.test(ua) ? "Chrome" : /Safari/.test(ua) ? "Safari" : "other";
+  return os + "/" + browser;
+}
+
+$("form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  $("start").disabled = true;
+  $("start").textContent = "Идет проверка...";
+  $("progress").hidden = false;
+  $("progress").replaceChildren();
+  $("result").hidden = true;
+
+  const report = {
+    v: 1,
+    at: new Date().toISOString(),
+    op: $("op").value,
+    net: $("net").value,
+    city: $("city").value.trim(),
+    dev: device(),
+    ect: navigator.connection ? navigator.connection.effectiveType : null,
+    results: [],
+  };
+
+  const rows = TARGETS.map(row);
+  for (let i = 0; i < TARGETS.length; i++) {
+    report.results.push(await check(TARGETS[i], rows[i]));
+  }
+
+  $("out").value = JSON.stringify(report);
+  $("result").hidden = false;
+  $("start").disabled = false;
+  $("start").textContent = "Проверить еще раз";
+  $("result").scrollIntoView({ behavior: "smooth" });
+});
+
+$("copy").addEventListener("click", async () => {
+  const text = $("out").value;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    $("out").select();
+    document.execCommand("copy");
+  }
+  $("copy").textContent = "Скопировано";
+  setTimeout(() => { $("copy").textContent = "Скопировать"; }, 2000);
+});
+</script>
+</body>
+</html>
